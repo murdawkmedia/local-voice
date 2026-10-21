@@ -8,7 +8,7 @@ failure without posting personal device identifiers. Include focused tests and r
 Preserve explicit recording, separate capture/model workers, bounded queues,
 session ownership, guarded insertion and optional summaries. Do not keep a hidden
 microphone open or add network inference. Never press Enter on behalf of the user.
-Do not change system audio/Bluetooth profiles or user services to make a test pass.
+Do not change audio/Bluetooth profiles, defaults or restart user audio services to make a test pass.
 
 Nostr proposals and GitHub pull requests are accepted. Mirrors must be updated with
 explicit intended refs after review; never force-push private development history.

@@ -35,6 +35,28 @@ class PersonalizationTests(unittest.TestCase):
         self.assertEqual(self.module.apply_personalization(raw, {}), ('generated   words', raw))
         self.assertEqual(self.module.apply_replacements(raw, {}), raw)
 
+    def test_spoken_email_at_symbol_preserves_original_and_punctuation(self):
+        for raw, expected in [
+                ('Send to alex at example.com.', 'Send to alex@example.com.'),
+                ('alex.smith+work AT mail.example.org, thanks.', 'alex.smith+work@mail.example.org, thanks.'),
+                ('Email alex at example.com and sam at example.org.', 'Email alex@example.com and sam@example.org.')]:
+            self.assertEqual(self.module.apply_personalization(raw, {}), (expected, raw))
+
+    def test_spoken_email_keeps_literals_websites_and_ordinary_prose(self):
+        for raw in ['Open contactsite.com or atlassian.com.', 'Look at example.com.',
+                    'Meet at example.com.', 'Visit us at example.com.',
+                    'alex at localhost', 'alex at bad-.com', 'alex at example.c',
+                    'Type "alex at example.com" or `alex at example.com`.',
+                    'https://example.com/alex at example.org', 'alex@example.com']:
+            self.assertEqual(self.module.apply_personalization(raw, {}), (raw, raw))
+
+    def test_private_joined_alias_uses_dictionary_and_snippets_are_literal(self):
+        profile = {'replacements': {'alexatexample.com': 'alex@example.com'},
+                   'snippets': {'literal': 'alex at example.com'}}
+        raw = 'Send to alexatexample.com.'
+        self.assertEqual(self.module.apply_personalization(raw, profile), ('Send to alex@example.com.', raw))
+        self.assertEqual(self.module.apply_personalization('literal', profile)[0], 'alex at example.com')
+
     def test_light_cleanup_removes_hesitations_and_retains_raw(self):
         cases = [
             ('Um, please send uh the file.', 'Please send the file.'),

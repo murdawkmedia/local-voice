@@ -10,7 +10,7 @@ optional and local. Successful audio is removed after nonempty text is saved;
 failed or interrupted attempts keep audio for Retry. No account, telemetry or
 cloud fallback is used. The app never presses Enter or changes Bluetooth profiles.
 
-This is an early source release, **0.1.0.dev6**, developed on a Hyprland/systemd/
+This is an early source release, **0.1.0.dev7**, developed on a Hyprland/systemd/
 PipeWire desktop. There is no general-purpose binary installer yet. Other desktops,
 distributions and hardware need testing. Initial model/GPU loading may take time;
 the readiness cue reports actual audio arrival, rather than promising instant capture.
@@ -18,7 +18,7 @@ the readiness cue reports actual audio arrival, rather than promising instant ca
 ## Developer setup
 
 Requirements: Linux, Python 3.11+, systemd user scopes, unprivileged user/network
-namespaces, PipeWire with PulseAudio compatibility (`parec`, `pactl`), `wl-copy`,
+namespaces, PipeWire with PulseAudio compatibility (`parec`, `pactl`), native PipeWire tools (`pw-cli`, `pw-dump`), `wl-copy`,
 `wtype`, `notify-send`, and Hyprland's `hyprctl` for guarded automatic insertion.
 The Ctrl+Super listener needs read access to input devices; configure a narrowly
 scoped system policy yourself. The app does not install broad input permissions.
@@ -58,8 +58,9 @@ summaries currently require the documented Qwen3/llama-server CUDA setup; see
 
 ## Using it
 
-Enable the hold shortcut in Settings, or use **Start dictation**. Minimize the
-window to keep the app available; closing quits. Shortcut results paste only when
+Enable the hold shortcut in Settings, or use **Start dictation**. Closing the window (including Super+W) leaves the app in the system tray.
+Click the microphone tray icon or choose Open Local Voice to reopen it. Use tray
+Quit to exit. With no tray host, a visible window remains available. Shortcut results paste only when
 the original window and released physical modifiers can be verified. Otherwise
 use History/Copy. No action sends a message. **Record meeting** requires both
 selected audio sources and fails visibly if either is unavailable.
@@ -83,3 +84,24 @@ Application source is GPL-3.0-or-later. PyQt is distributed under GPL v3 or a
 commercial license; see [Riverbank's licensing information](https://www.riverbankcomputing.com/software/pyqt/intro).
 Model weights and upstream engines have their own licenses and are not included.
 This project is independent of Wispr Flow and is not an official Wispr client.
+
+## Login startup and playback lowering
+
+Launch `local-voice --minimized` from your desktop login autostart to start hidden
+in the tray; launching the app normally opens its window. A repeated background
+start does not open the window. Qt registers the tray icon if the panel appears
+later; without a tray host the app shows a window so it remains reachable.
+
+Optional playback lowering applies a temporary quarter software gain to each output,
+covering media and notifications created during a Ctrl+Super dictation. Per-app
+volumes, microphone gain, mutes, default routes and Bluetooth profiles are untouched.
+Gain restores on key release independently of transcription/history work. Button
+dictation and meetings do not lower playback. The Bluetooth hardware/master volume stays unchanged. Original software gain is
+journaled before changes and checked on restoration; manual software-gain changes win. If an output disconnects, its
+recovery remains private until the same output returns. Old per-stream recovery
+is read before new lowering; normal gain is never guessed.
+
+Spoken email punctuation formats `alex at example.com` as `alex@example.com`.
+Quoted/code text and common website-location phrases stay literal. Joined forms
+need an exact private dictionary correction; website names are never split by guessing.
+The original recognition remains saved, and snippets expand exactly as written.

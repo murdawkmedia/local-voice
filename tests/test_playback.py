@@ -2,10 +2,10 @@ import json
 import unittest
 import tempfile
 from pathlib import Path
-from local_voice.playback import PlaybackDucker
+from local_voice.playback import _LegacyPlaybackRecovery as PlaybackDucker
 
 
-class PlaybackTests(unittest.TestCase):
+class LegacyStreamRecoveryTests(unittest.TestCase):
     def setUp(self):
         self.streams = [{'index': 7, 'volume': {'mono': {'value': 50000}},
                          'properties': {'application.name': 'Generated player'}}]
@@ -17,7 +17,7 @@ class PlaybackTests(unittest.TestCase):
             return b''
         self.ducker = PlaybackDucker(runner=run, server='unix:/generated/pulse/native')
 
-    def test_lowers_only_playback_stream_then_restores_exact_volume(self):
+    def test_legacy_stream_gain_restores_without_changing_output_controls(self):
         self.ducker.start()
         self.assertEqual(self.streams[0]['volume']['mono']['value'], 12500)
         self.ducker.stop()

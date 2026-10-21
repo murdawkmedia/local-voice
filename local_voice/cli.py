@@ -16,7 +16,7 @@ def _run_gui(args, service, done, request_quit, bind_activate):
     try:
         from PyQt6.QtCore import QObject, QTimer, pyqtSignal
         from PyQt6.QtGui import QAction, QIcon
-        from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+        from PyQt6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon
         from .gui import MainWindow
     except ImportError:
         if done.is_set():
@@ -35,6 +35,8 @@ def _run_gui(args, service, done, request_quit, bind_activate):
     app.setDesktopFileName('local-voice')
     window = MainWindow(service)
     icon = QIcon.fromTheme('audio-input-microphone')
+    if icon.isNull():
+        icon = app.style().standardIcon(QStyle.StandardPixmap.SP_MediaVolume)
     app.setWindowIcon(icon)
     bridge = Bridge()
 
@@ -70,32 +72,41 @@ def _run_gui(args, service, done, request_quit, bind_activate):
 
     bridge.show_requested.connect(show)
     bind_activate(bridge.show_requested.emit)
-    tray = None
-    if QSystemTrayIcon.isSystemTrayAvailable():
-        tray = QSystemTrayIcon(icon, app)
-        tray.setToolTip('Local Voice · offline')
-        menu = QMenu()
-        open_action = QAction('Open Local Voice', menu)
-        open_action.triggered.connect(show)
-        menu.addAction(open_action)
-        exit_action = QAction('Quit', menu)
-        exit_action.triggered.connect(request_quit)
-        menu.addAction(exit_action)
-        tray.setContextMenu(menu)
-        tray.activated.connect(lambda reason: show() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
-        tray.show()
+    tray_available = QSystemTrayIcon.isSystemTrayAvailable()
+    # Qt registers a visible icon automatically if the panel starts later.
+    tray = QSystemTrayIcon(icon, app)
+    tray.setToolTip('Local Voice · offline')
+    menu = QMenu()
+    open_action = QAction('Open Local Voice', menu)
+    open_action.triggered.connect(show)
+    menu.addAction(open_action)
+    exit_action = QAction('Quit', menu)
+    exit_action.triggered.connect(request_quit)
+    menu.addAction(exit_action)
+    tray.setContextMenu(menu)
+    tray.activated.connect(lambda reason: show() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
+    tray.show()
+    app.setQuitOnLastWindowClosed(not tray_available)
+
+    def can_hide():
+        available = QSystemTrayIcon.isSystemTrayAvailable()
+        app.setQuitOnLastWindowClosed(not available)
+        return available
+
+    window.close_to_tray = can_hide
     timer = QTimer()
     timer.timeout.connect(poll_quit)  # Also lets Python deliver POSIX signals.
     timer.start(200)
     if done.is_set():
         QTimer.singleShot(0, poll_quit)
     elif args.minimized:
-        window.showMinimized()
+        if not tray_available:
+            window.show()
     else:
         window.show()
     result = app.exec()
-    if tray:
-        tray.hide()
+    timer.stop()
+    tray.hide()
     return result, window
 
 
@@ -183,7 +194,7 @@ def main(argv=None):
                     print('Shutdown is incomplete. Pending work and private edit recovery need attention.', file=sys.stderr)
             return result if clean and edits_accepted else 1
     except AlreadyRunning:
-        result = send_command(args.runtime_dir, 'activate')
+        result = send_command(args.runtime_dir, 'status' if args.minimized else 'activate')
         if args.headless:
             print(json.dumps(result))
         return 0 if result.get('ok') else 1

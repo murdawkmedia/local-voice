@@ -15,6 +15,77 @@ from local_voice.ipc import send_command
 
 
 class CliTests(unittest.TestCase):
+    def test_missing_theme_icon_has_visible_fallback(self):
+        from local_voice import cli
+        from PyQt6.QtCore import QTimer
+        from PyQt6.QtGui import QIcon
+        from PyQt6.QtWidgets import QApplication, QMainWindow, QSystemTrayIcon
+        observed = []
+        class Window(QMainWindow):
+            def __init__(self, service):
+                super().__init__()
+                QTimer.singleShot(10, self.observe)
+            def observe(self):
+                icons = QApplication.instance().findChildren(QSystemTrayIcon)
+                observed.append(any(i.isVisible() and not i.icon().isNull() for i in icons))
+                QApplication.instance().quit()
+        with patch('PyQt6.QtGui.QIcon.fromTheme', return_value=QIcon()), \
+                patch('PyQt6.QtWidgets.QSystemTrayIcon.isSystemTrayAvailable', return_value=True), \
+                patch('local_voice.gui.MainWindow', Window):
+            cli._run_gui(types.SimpleNamespace(minimized=True), object(), threading.Event(),
+                         lambda: None, lambda callback: None)
+        self.assertEqual(observed, [True])
+
+    def test_repeated_background_start_does_not_reopen_the_window(self):
+        from local_voice import cli
+        class Existing:
+            def __init__(self, *args): pass
+            def __enter__(self): raise cli.AlreadyRunning()
+            def __exit__(self, *args): pass
+        with patch.object(cli, 'Instance', Existing), patch.object(cli, 'send_command', return_value={'ok': True}) as send:
+            self.assertEqual(cli.main(['--minimized']), 0)
+        self.assertEqual(send.call_args.args[1], 'status')
+
+    def test_tray_can_register_when_the_panel_appears_after_startup(self):
+        from local_voice import cli
+        from PyQt6.QtCore import QTimer
+        from PyQt6.QtWidgets import QApplication, QMainWindow, QSystemTrayIcon
+        available, observed = [False], []
+        class Window(QMainWindow):
+            def __init__(self, service):
+                super().__init__()
+                QTimer.singleShot(10, self.observe)
+            def observe(self):
+                available[0] = True
+                observed.append(self.close_to_tray())
+                observed.append(any(icon.isVisible() for icon in QApplication.instance().findChildren(QSystemTrayIcon)))
+                QApplication.instance().quit()
+        with patch('PyQt6.QtWidgets.QSystemTrayIcon.isSystemTrayAvailable', side_effect=lambda: available[0]), \
+                patch('local_voice.gui.MainWindow', Window):
+            cli._run_gui(types.SimpleNamespace(minimized=True), object(), threading.Event(),
+                         lambda: None, lambda callback: None)
+        self.assertEqual(observed, [True, True])
+
+    def test_minimized_start_is_hidden_with_tray_and_visible_without_one(self):
+        from local_voice import cli
+        from PyQt6.QtCore import QTimer
+        from PyQt6.QtWidgets import QApplication, QMainWindow
+        for tray_available in (True, False):
+            with self.subTest(tray_available=tray_available):
+                observed = []
+                class Window(QMainWindow):
+                    def __init__(self, service):
+                        super().__init__()
+                        QTimer.singleShot(10, self.observe)
+                    def observe(self):
+                        observed.append((self.isVisible(), self.isMinimized()))
+                        QApplication.instance().quit()
+                with patch('PyQt6.QtWidgets.QSystemTrayIcon.isSystemTrayAvailable', return_value=tray_available), \
+                        patch('local_voice.gui.MainWindow', Window):
+                    cli._run_gui(types.SimpleNamespace(minimized=True), object(), threading.Event(),
+                                 lambda: None, lambda callback: None)
+                self.assertEqual(observed, [(not tray_available, False)])
+
     def test_cancel_quit_clears_same_event_and_does_not_repeat_prompt(self):
         from local_voice import cli
         from PyQt6.QtCore import QTimer

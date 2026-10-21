@@ -8,6 +8,31 @@ _LITERALS = re.compile(
     r"(?<!\w)'[^'\n]*'(?!\w)|https?://[^\s]+|[^\s]+@[^\s]+")
 _HESITATIONS = re.compile(r'(?<![\w./@\\\-\'’])(?:[Uu]m{1,3}|[Uu]h{1,3}|[Uu]hm{1,2}|ah{1,3})(?![\w/@\\\-\'’])')
 
+_SPOKEN_EMAIL = re.compile(
+    r'(?<![\w./@+%\\-])([a-z0-9_+%-]+(?:\.[a-z0-9_+%-]+)*)[ \t]+at[ \t]+'
+    r'((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63})'
+    r'(?![\w/@\\-]|\.[\w-])', re.IGNORECASE)
+# These usually introduce a website/location, not an email local part. An exact
+# private dictionary replacement can resolve an intentionally ambiguous address.
+_LOCATION_WORDS = frozenset('at look meet meeting us me you them it this that here there '
+                            'online available located visit website site found more details '
+                            'see read work working arrive arriving stay staying back home'.split())
+
+
+def format_spoken_emails(text):
+    """Format explicit word-separated email 'at'; never split joined domains.
+
+    Keep literal/code/URL spans and common location prose unchanged. This is
+    deterministic punctuation formatting, independent of hesitation cleanup.
+    """
+    literals = [m.span() for m in _LITERALS.finditer(text)]
+    def replace(match):
+        if (match[1].casefold() in _LOCATION_WORDS or
+                any(left < match.end() and match.start() < right for left, right in literals)):
+            return match[0]
+        return match[1] + '@' + match[2]
+    return _SPOKEN_EMAIL.sub(replace, text)
+
 
 def clean_hesitations(text):
     """Remove a small set of hesitations, without paraphrasing or reflowing text.
@@ -80,4 +105,5 @@ def apply_personalization(text, profile, *, clean_fillers=False):
             return expansion, text
     if clean_fillers:
         stripped = clean_hesitations(stripped).strip()
+    stripped = format_spoken_emails(stripped)
     return apply_replacements(stripped, profile.get('replacements', {})), text

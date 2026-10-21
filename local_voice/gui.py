@@ -344,7 +344,7 @@ class MainWindow(QMainWindow):
         for key, text in [('autoPaste', 'Paste dictation when the original window still has focus'),
                           ('cleanFillers', 'Remove um, uh and clear hesitation ahs from English dictation'),
                           ('readyNotification', 'Show a silent Listening notification when the shortcut is ready'),
-                          ('lowerPlayback', 'Lower playing apps while dictating'),
+                          ('lowerPlayback', 'Lower all playback while holding Ctrl + Super'),
                           ('hotkeyEnabled', 'Enable Ctrl + Super hold shortcut')]:
             check = QCheckBox(text)
             check.toggled.connect(lambda value, key=key: self.service.configure(**{key: value}) if not self._loading else None)
@@ -427,7 +427,11 @@ class MainWindow(QMainWindow):
     def request_close(self):
         if self._dictionary_close_pending or self._transcript_close_pending:
             return False
-        return self.close()
+        self._explicit_quit = True
+        try:
+            return self.close()
+        finally:
+            self._explicit_quit = False
 
     def _dictionary_ready_to_close(self):
         self._dictionary_close_pending = False
@@ -590,6 +594,13 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(0, self.request_close)
 
     def closeEvent(self, event):
+        # A window-manager close leaves recording, edits and shortcuts alive.
+        # Only the tray/IPC/signal Quit path enters durable shutdown below.
+        available = getattr(self, 'close_to_tray', lambda: False)
+        if not getattr(self, '_explicit_quit', False) and available():
+            self.hide()
+            event.ignore()
+            return
         if self._dictionary_close_pending or self._transcript_close_pending:
             event.ignore()
             return

@@ -62,6 +62,38 @@ class FakeHotkeys:
 
 
 class ServiceTests(unittest.TestCase):
+    def test_button_dictation_does_not_lower_playback(self):
+        self.settings.update(lowerPlayback=True)
+        self.service.start_sync('dictation', origin='button')
+        self.service.tick()
+        self.assertEqual(self.ducker.starts, 0)
+
+    def test_release_restores_playback_even_when_history_monitor_is_blocked(self):
+        self.settings.update(lowerPlayback=True)
+        service = Service(self.store, self.settings, self.root/'other-state', lambda: None,
+                          controller_factory=FakeController, output=self.output,
+                          devices_fn=lambda: self.devices, ducker=self.ducker, background=True)
+        self.addCleanup(service.close)
+        self.assertTrue(until(lambda: service._startup_done.is_set()))
+        owner = {'request': threading.Event(), 'sid': None, 'released': False}
+        service._hotkey_request = owner
+        service.start_sync('dictation', origin='hotkey', request=owner['request'], owner=owner)
+        self.assertTrue(until(lambda: self.ducker.starts > 0))
+        entered, unblock = threading.Event(), threading.Event()
+        original = self.store.list_sessions
+        def held_history(*args, **kwargs):
+            entered.set(); unblock.wait(2)
+            return original(*args, **kwargs)
+        try:
+            with patch.object(self.store, 'list_sessions', held_history):
+                self.assertTrue(entered.wait(1))
+                before = self.ducker.stops
+                service._hotkey_release()
+                self.assertTrue(until(lambda: self.ducker.stops > before, timeout=.4),
+                                'History refresh must not delay volume restoration')
+        finally:
+            unblock.set()
+
     def test_controller_startup_failure_closes_new_notification_worker(self):
         from local_voice.readiness import ReadyNotifier
         created = []

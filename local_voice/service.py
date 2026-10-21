@@ -27,7 +27,8 @@ class Service:
         self.state_dir = Path(state_dir)
         self.output = output or DesktopOutput()
         self.devices_fn = devices_fn
-        self.ducker = ducker or PlaybackDucker(journal=self.state_dir / 'playback.json')
+        self.ducker = ducker or PlaybackDucker(journal=self.state_dir / 'playback-outputs.json',
+                                               legacy_journal=self.state_dir / 'playback.json')
         self.summarizer = summarizer
         self.model_lock = model_lock or threading.Lock()
         self._lock = threading.RLock()
@@ -43,6 +44,10 @@ class Service:
         self._startup_done = threading.Event()
         self._recovery_ok = False
         self._playback_done = threading.Event()
+        self._playback_wakeup = threading.Event()
+        self._playback_background = background
+        self._capture_playback_signature = None
+        self._playback_refresh_at = 0
         self._durable_failed = False
         self._pending_edits = {}
         self._committed_edits = {}
@@ -74,14 +79,15 @@ class Service:
         try:
             self.controller = controller_factory(store, self.state_dir, engine_factory, self.sources,
                                                  cleanup_provider=self._cleanup_enabled,
-                                                 event_callback=self._readiness.observe)
+                                                 event_callback=self._observe_capture)
         except Exception:
             self._readiness.close()
             raise
         if background:
             self._ensure_command_worker()
             for target, name in [(self._monitor, 'voice-state'),
-                                 (self._desktop_loop, 'voice-desktop')]:
+                                 (self._desktop_loop, 'voice-desktop'),
+                                 (self._playback_loop, 'voice-playback')]:
                 thread = threading.Thread(target=target, name=name, daemon=True)
                 thread.start()
                 self._threads.append(thread)
@@ -93,6 +99,57 @@ class Service:
         values = self.settings.get()
         # These are English rules: 'um' is a meaningful word in other languages.
         return values['cleanFillers'] and values['language'].casefold().split('-', 1)[0] == 'en'
+
+    def _observe_capture(self, state):
+        self._readiness.observe(state)
+        signature = (state.get('sessionId'), state.get('kind'), state.get('captureActive'))
+        if signature != self._capture_playback_signature:
+            self._capture_playback_signature = signature
+            self._playback_wakeup.set()
+
+    def _playback_loop(self):
+        self._startup_done.wait()
+        try:
+            while not self._closed.is_set():
+                self._playback_wakeup.clear()
+                try:
+                    self._playback_tick()
+                except Exception:
+                    self._tell('Playback restoration is pending. Your volume changes are preserved.')
+                self._playback_wakeup.wait(.25)
+        finally:
+            try:
+                with self._playback_lock:
+                    self.ducker.stop()
+                    self._ducked = None
+                self._playback_done.set()
+            except Exception:
+                self._tell('Playback restoration is pending. Your volume changes are preserved.')
+
+    def _playback_tick(self):
+        state = self.controller.status()
+        values = self.settings.get()
+        with self._playback_lock:
+            with self._lock:
+                owner = self._hotkey_active
+                held = (owner is not None and not owner['released'] and
+                        owner['sid'] == state.get('sessionId'))
+            should_duck = (held and not self._closed.is_set() and values['lowerPlayback']
+                           and state.get('kind') == 'dictation' and state.get('captureActive', False))
+            if should_duck:
+                if self._ducked != state['sessionId']:
+                    self.ducker.stop()
+                    # Track a partially applied mutation too, so release retries it.
+                    self._ducked = state['sessionId']
+                    self.ducker.start()
+                    self._playback_refresh_at = time.monotonic() + .25
+                elif hasattr(self.ducker, 'refresh') and time.monotonic() >= self._playback_refresh_at:
+                    self.ducker.refresh()
+                    self._playback_refresh_at = time.monotonic() + .25
+            elif self._ducked is not None or getattr(self.ducker, 'pending', False) or not self._recovery_ok:
+                self.ducker.stop()
+                self._ducked = None
+                self._recovery_ok = True
 
     def _tell(self, message):
         with self._lock:
@@ -307,6 +364,9 @@ class Service:
             if self._pending_start is not None:
                 self._pending_start.set()
             self._readiness.cancel()
+            if self._hotkey_active is not None:
+                self._hotkey_active['released'] = True
+        self._playback_wakeup.set()
         self.controller.stop()
 
     def select_session(self, sid):
@@ -567,6 +627,7 @@ class Service:
             owner['released'] = True
             if owner['request'] is not None:
                 owner['request'].set()
+        self._playback_wakeup.set()
         if owner['sid'] is not None:
             self._readiness.cancel(owner['sid'])
         self._stop_owned_hotkey(owner)
@@ -614,22 +675,8 @@ class Service:
             values = self.settings.get()
             active = state.get('captureActive', state.get('state') in {'preparing', 'recording', 'stopping'})
             sid = state.get('sessionId')
-            should_duck = active and state.get('kind') == 'dictation' and values['lowerPlayback']
-            with self._playback_lock:
-                should_duck = should_duck and not self._closed.is_set()
-                if should_duck and self._ducked != sid:
-                    try:
-                        self.ducker.stop()
-                        self.ducker.start()
-                        self._ducked = sid
-                    except Exception:
-                        self._tell('Playback could not be lowered. Recording continues.')
-                elif not should_duck and self._ducked is not None:
-                    try:
-                        self.ducker.stop()
-                        self._ducked = None
-                    except Exception:
-                        self._tell('Playback restoration is pending. Your volume changes are preserved.')
+            if not self._playback_background:
+                self._playback_tick()
             if not self._closed.is_set():
                 self._configure_hotkeys(values['hotkeyEnabled'])
             with self._lock:

@@ -31,6 +31,26 @@ class FakeService:
 
 
 class NativeWindowTests(unittest.TestCase):
+    def test_window_close_hides_to_tray_without_starting_shutdown(self):
+        self.window.close_to_tray = lambda: True
+        self.window.show()
+        self.window.close()
+        self.assertFalse(self.window.isVisible())
+        self.assertFalse(self.window._closing_requested)
+        self.assertFalse(self.window.shutdown_edits_accepted)
+        self.assertFalse(any(c[0] == 'stop' for c in self.service.calls))
+
+    def test_explicit_quit_still_closes_when_close_to_tray_is_available(self):
+        self.window.close_to_tray = lambda: True
+        self.window.show()
+        deadline = time.monotonic() + 2
+        closed = self.window.request_close()
+        while not closed and time.monotonic() < deadline:
+            self.app.processEvents()
+            closed = self.window.request_close()
+        self.assertTrue(closed)
+        self.assertTrue(self.window._closing_requested)
+
     def test_silent_ready_notification_setting_refresh_and_toggle(self):
         self.assertIn('readyNotification', self.window.checks)
         self.service.data['settings']['readyNotification'] = True
