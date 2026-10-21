@@ -1,0 +1,1051 @@
+diff --git i/src/app/dispatch.rs w/src/app/dispatch.rs
+index 7682b87..b346eb0 100644
+--- i/src/app/dispatch.rs
++++ w/src/app/dispatch.rs
+@@ -119,7 +119,11 @@ pub(crate) async fn dispatch(
+             menubar::run(state_file);
+         }
+ 
+-        Commands::Transcribe { file, engine } => {
++        Commands::Transcribe {
++            file,
++            engine,
++            result_json,
++        } => {
+             if let Some(engine_name) = engine {
+                 match engine_name.parse::<config::TranscriptionEngine>() {
+                     Ok(e) => config.engine = e,
+@@ -133,7 +137,7 @@ pub(crate) async fn dispatch(
+                     }
+                 }
+             }
+-            transcribe_file(&config, &file)?;
++            transcribe_file(&config, &file, result_json.as_deref())?;
+         }
+ 
+         Commands::TranscribeWorker {
+diff --git i/src/app/mod.rs w/src/app/mod.rs
+index 03f490f..393b241 100644
+--- i/src/app/mod.rs
++++ w/src/app/mod.rs
+@@ -27,6 +27,7 @@ mod macos;
+ mod meeting;
+ mod overrides;
+ mod record;
++mod result_json;
+ pub(crate) mod sigpipe;
+ mod status;
+ mod transcribe_file;
+diff --git i/src/app/transcribe_file.rs w/src/app/transcribe_file.rs
+index c4441ea..3085f88 100644
+--- i/src/app/transcribe_file.rs
++++ w/src/app/transcribe_file.rs
+@@ -4,37 +4,93 @@
+ //! one call site (this command). Per the refactoring policy: don't extract
+ //! an abstraction from a single use site.
+ 
+-use std::path::PathBuf;
++use std::path::{Path, PathBuf};
+ use voxtype::{config, transcribe, vad};
+ 
+ /// Transcribe an audio file
+-pub(crate) fn transcribe_file(config: &config::Config, path: &PathBuf) -> anyhow::Result<()> {
++pub(crate) fn transcribe_file(
++    config: &config::Config,
++    path: &PathBuf,
++    result_json: Option<&Path>,
++) -> anyhow::Result<()> {
++    if let Some(destination) = result_json {
++        // Machine mode has only local in-process ASR, never remote/CLI backends
++        // or a daemon worker. The supervising caller owns this entire process.
++        anyhow::ensure!(
++            matches!(
++                config.engine,
++                config::TranscriptionEngine::Whisper | config::TranscriptionEngine::Parakeet
++            ),
++            "--result-json supports only local whisper and parakeet"
++        );
++        if config.engine == config::TranscriptionEngine::Whisper {
++            anyhow::ensure!(
++                config.whisper.effective_mode() == config::WhisperMode::Local,
++                "--result-json requires whisper mode = local"
++            );
++        }
++        let mut local = config.clone();
++        local.whisper.gpu_isolation = false;
++        local.whisper.streaming = false;
++        if let Some(parakeet) = local.parakeet.as_mut() {
++            parakeet.streaming = false;
++        }
++        return super::result_json::publish_result(destination, local.engine.name(), || {
++            Ok(transcribe_audio(&local, path, true)?.unwrap_or_default())
++        });
++    }
++    if let Some(text) = transcribe_audio(config, path, false)? {
++        println!("\n{}", process_transcript(config, &text));
++    }
++    Ok(())
++}
++
++fn transcribe_audio(
++    config: &config::Config,
++    path: &PathBuf,
++    machine: bool,
++) -> anyhow::Result<Option<String>> {
+     use hound::WavReader;
+ 
+-    println!("Loading audio file: {:?}", path);
++    macro_rules! status {
++        ($($argument:tt)*) => {
++            if machine { eprintln!($($argument)*); } else { println!($($argument)*); }
++        };
++    }
++
++    status!("Loading audio file: {:?}", path);
+ 
+     let reader = WavReader::open(path)?;
+     let spec = reader.spec();
+ 
+-    println!(
++    status!(
+         "Audio format: {} Hz, {} channel(s), {:?}",
+-        spec.sample_rate, spec.channels, spec.sample_format
++        spec.sample_rate,
++        spec.channels,
++        spec.sample_format
+     );
+ 
+     // Convert samples to f32 mono at 16kHz
+     let samples: Vec<f32> = match spec.sample_format {
+         hound::SampleFormat::Int => {
+             let max_val = (1 << (spec.bits_per_sample - 1)) as f32;
+-            reader
++            let decoded = reader
+                 .into_samples::<i32>()
+-                .filter_map(|s| s.ok())
+-                .map(|s| s as f32 / max_val)
+-                .collect()
++                .map(|s| s.map(|s| s as f32 / max_val));
++            if machine {
++                decoded.collect::<Result<Vec<_>, _>>()?
++            } else {
++                decoded.filter_map(Result::ok).collect()
++            }
++        }
++        hound::SampleFormat::Float => {
++            let decoded = reader.into_samples::<f32>();
++            if machine {
++                decoded.collect::<Result<Vec<_>, _>>()?
++            } else {
++                decoded.filter_map(Result::ok).collect()
++            }
+         }
+-        hound::SampleFormat::Float => reader
+-            .into_samples::<f32>()
+-            .filter_map(|s| s.ok())
+-            .collect(),
+     };
+ 
+     // Mix to mono if stereo
+@@ -49,30 +105,38 @@ pub(crate) fn transcribe_file(config: &config::Config, path: &PathBuf) -> anyhow
+ 
+     // Resample to 16kHz if needed
+     let final_samples = if spec.sample_rate != 16000 {
+-        println!("Resampling from {} Hz to 16000 Hz...", spec.sample_rate);
++        status!("Resampling from {} Hz to 16000 Hz...", spec.sample_rate);
+         voxtype::audio::resampler::resample_buffer(&mono_samples, spec.sample_rate, 16000)
+     } else {
+         mono_samples
+     };
+ 
+-    println!(
++    status!(
+         "Processing {} samples ({:.2}s)...",
+         final_samples.len(),
+         final_samples.len() as f32 / 16000.0
+     );
+ 
++    // Machine jobs must validate/load the selected local model even when VAD
++    // later returns no speech; a missing model is never an empty success.
++    let machine_transcriber = if machine {
++        Some(transcribe::create_transcriber(config)?)
++    } else {
++        None
++    };
++
+     // Run VAD if enabled
+     if let Ok(Some(vad)) = vad::create_vad(config) {
+         match vad.detect(&final_samples) {
+             Ok(result) => {
+-                println!(
++                status!(
+                     "VAD: {:.2}s speech ({:.1}% of audio)",
+                     result.speech_duration_secs,
+                     result.speech_ratio * 100.0
+                 );
+                 if !result.has_speech {
+-                    println!("No speech detected, skipping transcription.");
+-                    return Ok(());
++                    status!("No speech detected, skipping transcription.");
++                    return Ok(None);
+                 }
+             }
+             Err(e) => {
+@@ -83,11 +147,13 @@ pub(crate) fn transcribe_file(config: &config::Config, path: &PathBuf) -> anyhow
+     }
+ 
+     // Create transcriber and transcribe
+-    let transcriber = transcribe::create_transcriber(config)?;
++    let transcriber = match machine_transcriber {
++        Some(transcriber) => transcriber,
++        None => transcribe::create_transcriber(config)?,
++    };
+     let text = transcriber.transcribe(&final_samples)?;
+ 
+-    println!("\n{}", process_transcript(config, &text));
+-    Ok(())
++    Ok(Some(text))
+ }
+ 
+ /// Apply the configured text pipeline (replacements, spoken punctuation,
+diff --git i/src/cli/commands.rs w/src/cli/commands.rs
+index 76c9baa..4ba40de 100644
+--- i/src/cli/commands.rs
++++ w/src/cli/commands.rs
+@@ -31,6 +31,10 @@ pub enum Commands {
+             long_help = format!("Override transcription engine: {}", super::ENGINE_NAMES_CSV),
+         )]
+         engine: Option<String>,
++
++        /// Atomically write raw local recognition as private JSON; no transcript on stdout
++        #[arg(long, value_name = "PATH")]
++        result_json: Option<std::path::PathBuf>,
+     },
+ 
+     /// Internal: Worker process for GPU-isolated transcription
+diff --git i/src/cli/root.rs w/src/cli/root.rs
+index 5780594..181ffeb 100644
+--- i/src/cli/root.rs
++++ w/src/cli/root.rs
+@@ -644,7 +644,7 @@ mod tests {
+     fn test_transcribe_engine_flag() {
+         let cli = Cli::parse_from(["voxtype", "transcribe", "test.wav", "--engine", "moonshine"]);
+         match cli.command {
+-            Some(Commands::Transcribe { file, engine }) => {
++            Some(Commands::Transcribe { file, engine, .. }) => {
+                 assert_eq!(file, std::path::PathBuf::from("test.wav"));
+                 assert_eq!(engine, Some("moonshine".to_string()));
+             }
+diff --git i/src/main.rs w/src/main.rs
+index 5031204..1b10f3a 100644
+--- i/src/main.rs
++++ w/src/main.rs
+@@ -28,8 +28,15 @@ async fn main() -> anyhow::Result<()> {
+ 
+     let cli = Cli::parse();
+ 
+-    // Check if this is the worker command (needs stderr-only logging)
+-    let is_worker = matches!(cli.command, Some(Commands::TranscribeWorker { .. }));
++    // Machine-facing commands reserve stdout; diagnostics belong on stderr.
++    let stderr_logging = matches!(
++        &cli.command,
++        Some(Commands::TranscribeWorker { .. })
++            | Some(Commands::Transcribe {
++                result_json: Some(_),
++                ..
++            })
++    );
+ 
+     // Initialize logging
+     let log_level = if cli.quiet {
+@@ -42,8 +49,8 @@ async fn main() -> anyhow::Result<()> {
+         }
+     };
+ 
+-    if is_worker {
+-        // Worker uses stderr for logging (stdout is reserved for IPC protocol)
++    if stderr_logging {
++        // Machine-facing commands keep diagnostics on stderr.
+         tracing_subscriber::fmt()
+             .with_env_filter(
+                 EnvFilter::try_from_default_env()
+diff --git 1/src/app/result_json.rs 2/src/app/result_json.rs
+new file mode 100644
+index 0000000..717db0a
+--- /dev/null
++++ 2/src/app/result_json.rs
+@@ -0,0 +1,175 @@
++//! Atomic, private machine results for one-shot file transcription.
++use anyhow::Context;
++use std::fs;
++use std::io::Write;
++use std::os::unix::fs::{MetadataExt, PermissionsExt};
++use std::path::Path;
++
++pub(super) fn publish_result(
++    path: &Path,
++    engine: &str,
++    transcribe: impl FnOnce() -> anyhow::Result<String>,
++) -> anyhow::Result<()> {
++    let parent = path
++        .parent()
++        .filter(|p| !p.as_os_str().is_empty())
++        .unwrap_or(Path::new("."));
++    let metadata = fs::symlink_metadata(parent).context("result directory unavailable")?;
++    anyhow::ensure!(
++        metadata.is_dir()
++            && metadata.uid() == unsafe { libc::geteuid() }
++            && metadata.permissions().mode() & 0o077 == 0,
++        "result directory must be an owned private directory (mode 0700)"
++    );
++    anyhow::ensure!(path.file_name().is_some(), "result file name is required");
++    match fs::symlink_metadata(path) {
++        Ok(_) => anyhow::bail!("result destination already exists"),
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
++        Err(e) => return Err(e).context("cannot inspect result destination"),
++    }
++
++    // Failures propagate before any result or temporary result is created.
++    let text = transcribe()?;
++    let result = serde_json::json!({
++        "schemaVersion": 1,
++        "status": if text.is_empty() { "empty" } else { "success" },
++        "text": text,
++        "engine": engine,
++    });
++    let mut temporary = tempfile::Builder::new()
++        .prefix(".voxtype-result-")
++        .tempfile_in(parent)?;
++    temporary
++        .as_file()
++        .set_permissions(fs::Permissions::from_mode(0o600))?;
++    serde_json::to_writer(temporary.as_file_mut(), &result)?;
++    temporary.as_file_mut().write_all(b"\n")?;
++    temporary.as_file().sync_all()?;
++    rename_noreplace(temporary.path(), path).context("cannot publish result")?;
++    // NamedTempFile's drop only removes its old random name, never `path`.
++    Ok(())
++}
++
++#[cfg(target_os = "linux")]
++fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
++    use std::ffi::CString;
++    use std::os::unix::ffi::OsStrExt;
++    let source = CString::new(source.as_os_str().as_bytes())?;
++    let destination = CString::new(destination.as_os_str().as_bytes())?;
++    // RENAME_NOREPLACE is atomic and closes the check/rename overwrite race.
++    // Both paths are NUL-terminated, live through this call, and share a directory.
++    let result = unsafe {
++        libc::renameat2(
++            libc::AT_FDCWD,
++            source.as_ptr(),
++            libc::AT_FDCWD,
++            destination.as_ptr(),
++            libc::RENAME_NOREPLACE,
++        )
++    };
++    if result == 0 {
++        Ok(())
++    } else {
++        Err(std::io::Error::last_os_error())
++    }
++}
++
++#[cfg(not(target_os = "linux"))]
++fn rename_noreplace(_source: &Path, _destination: &Path) -> std::io::Result<()> {
++    Err(std::io::Error::new(
++        std::io::ErrorKind::Unsupported,
++        "--result-json requires Linux atomic no-replace rename",
++    ))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::fs;
++    use std::os::unix::fs::PermissionsExt;
++
++    fn private_dir() -> tempfile::TempDir {
++        let dir = tempfile::tempdir().unwrap();
++        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
++        dir
++    }
++
++    #[test]
++    fn unicode_and_newlines_are_lossless_and_artifact_is_private() {
++        let dir = private_dir();
++        let path = dir.path().join("result.json");
++        let text = "  Café — 日本語\nSecond line: \"quoted\" \\ tail\n";
++        publish_result(&path, "parakeet", || Ok(text.to_owned())).unwrap();
++        let result: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
++        assert_eq!(
++            result,
++            serde_json::json!({
++                "schemaVersion": 1, "status": "success", "text": text, "engine": "parakeet"
++            })
++        );
++        assert_eq!(
++            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
++            0o600
++        );
++        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
++    }
++
++    #[test]
++    fn empty_recognition_is_an_explicit_empty_result() {
++        let dir = private_dir();
++        let path = dir.path().join("result.json");
++        publish_result(&path, "whisper", || Ok(String::new())).unwrap();
++        let result: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
++        assert_eq!(result["status"], "empty");
++        assert_eq!(result["text"], "");
++        assert_eq!(result["engine"], "whisper");
++    }
++
++    #[test]
++    fn existing_destination_is_preserved_and_inference_is_not_started() {
++        let dir = private_dir();
++        let path = dir.path().join("result.json");
++        fs::write(&path, b"keep existing bytes").unwrap();
++        let error = publish_result(&path, "whisper", || panic!("must reject before inference"));
++        assert!(error.is_err());
++        assert_eq!(fs::read(&path).unwrap(), b"keep existing bytes");
++        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
++    }
++
++    #[test]
++    fn failed_transcription_does_not_create_a_result_or_temporary_file() {
++        let dir = private_dir();
++        let path = dir.path().join("result.json");
++        let error = publish_result(&path, "whisper", || {
++            anyhow::bail!("synthetic recognition failure")
++        });
++        assert!(format!("{}", error.unwrap_err()).contains("synthetic recognition failure"));
++        assert!(!path.exists());
++        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
++    }
++
++    #[test]
++    fn racing_destination_is_never_overwritten() {
++        let dir = private_dir();
++        let path = dir.path().join("result.json");
++        let error = publish_result(&path, "whisper", || {
++            fs::write(&path, b"concurrent owner").unwrap();
++            Ok("new recognition".to_owned())
++        });
++        assert!(error.is_err());
++        assert_eq!(fs::read(&path).unwrap(), b"concurrent owner");
++        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
++    }
++
++    #[test]
++    fn destination_symlink_is_preserved() {
++        let dir = private_dir();
++        let target = dir.path().join("target");
++        let path = dir.path().join("result.json");
++        fs::write(&target, b"target bytes").unwrap();
++        std::os::unix::fs::symlink(&target, &path).unwrap();
++        assert!(publish_result(&path, "parakeet", || panic!("must reject symlink")).is_err());
++        assert_eq!(fs::read(target).unwrap(), b"target bytes");
++        assert!(fs::symlink_metadata(path).unwrap().file_type().is_symlink());
++    }
++}
+diff --git 1/tests/result-json-harness/Cargo.toml 2/tests/result-json-harness/Cargo.toml
+new file mode 100644
+index 0000000..c4132f3
+--- /dev/null
++++ 2/tests/result-json-harness/Cargo.toml
+@@ -0,0 +1,22 @@
++[package]
++name = "voxtype-result-json-tests"
++version = "0.0.0"
++edition = "2021"
++publish = false
++
++[workspace]
++
++[dependencies]
++anyhow = "1"
++serde_json = "1"
++tempfile = "3"
++libc = "0.2"
++clap = { version = "4", features = ["derive", "env"] }
++
++[[test]]
++name = "result_json"
++path = "result_json.rs"
++
++[[test]]
++name = "cli"
++path = "cli.rs"
+diff --git 1/tests/result-json-harness/Cargo.lock 2/tests/result-json-harness/Cargo.lock
+new file mode 100644
+index 0000000..4714804
+--- /dev/null
++++ 2/tests/result-json-harness/Cargo.lock
+@@ -0,0 +1,345 @@
++# This file is automatically @generated by Cargo.
++# It is not intended for manual editing.
++version = 4
++
++[[package]]
++name = "anstream"
++version = "1.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "824a212faf96e9acacdbd09febd34438f8f711fb84e09a8916013cd7815ca28d"
++dependencies = [
++ "anstyle",
++ "anstyle-parse",
++ "anstyle-query",
++ "anstyle-wincon",
++ "colorchoice",
++ "is_terminal_polyfill",
++ "utf8parse",
++]
++
++[[package]]
++name = "anstyle"
++version = "1.0.14"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
++
++[[package]]
++name = "anstyle-parse"
++version = "1.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "52ce7f38b242319f7cabaa6813055467063ecdc9d355bbb4ce0c68908cd8130e"
++dependencies = [
++ "utf8parse",
++]
++
++[[package]]
++name = "anstyle-query"
++version = "1.1.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
++dependencies = [
++ "windows-sys",
++]
++
++[[package]]
++name = "anstyle-wincon"
++version = "3.0.11"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
++dependencies = [
++ "anstyle",
++ "once_cell_polyfill",
++ "windows-sys",
++]
++
++[[package]]
++name = "anyhow"
++version = "1.0.104"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
++
++[[package]]
++name = "bitflags"
++version = "2.13.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
++
++[[package]]
++name = "cfg-if"
++version = "1.0.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
++
++[[package]]
++name = "clap"
++version = "4.6.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "aa8876b300ab35ba921adea3dfd70157a46249b33f95c9084ae5709785478946"
++dependencies = [
++ "clap_builder",
++ "clap_derive",
++]
++
++[[package]]
++name = "clap_builder"
++version = "4.6.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ec0797fb7aeb1406c84efac526901f7ec3ead2124f946b494e72879d4b54704d"
++dependencies = [
++ "anstream",
++ "anstyle",
++ "clap_lex",
++ "strsim",
++]
++
++[[package]]
++name = "clap_derive"
++version = "4.6.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f9c751b79415d4e559e3d1fcf128e09e720eb673a06d26cf6f392d37d75b66e0"
++dependencies = [
++ "heck",
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "clap_lex"
++version = "1.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
++
++[[package]]
++name = "colorchoice"
++version = "1.0.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
++
++[[package]]
++name = "errno"
++version = "0.3.14"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
++dependencies = [
++ "libc",
++ "windows-sys",
++]
++
++[[package]]
++name = "fastrand"
++version = "2.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
++
++[[package]]
++name = "getrandom"
++version = "0.4.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
++dependencies = [
++ "cfg-if",
++ "libc",
++ "r-efi",
++]
++
++[[package]]
++name = "heck"
++version = "0.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
++
++[[package]]
++name = "is_terminal_polyfill"
++version = "1.70.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
++
++[[package]]
++name = "itoa"
++version = "1.0.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
++
++[[package]]
++name = "libc"
++version = "0.2.191"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
++
++[[package]]
++name = "linux-raw-sys"
++version = "0.12.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
++
++[[package]]
++name = "memchr"
++version = "2.8.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
++
++[[package]]
++name = "once_cell"
++version = "1.21.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
++
++[[package]]
++name = "once_cell_polyfill"
++version = "1.70.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
++
++[[package]]
++name = "proc-macro2"
++version = "1.0.107"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
++dependencies = [
++ "unicode-ident",
++]
++
++[[package]]
++name = "quote"
++version = "1.0.47"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
++dependencies = [
++ "proc-macro2",
++]
++
++[[package]]
++name = "r-efi"
++version = "6.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
++
++[[package]]
++name = "rustix"
++version = "1.1.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
++dependencies = [
++ "bitflags",
++ "errno",
++ "libc",
++ "linux-raw-sys",
++ "windows-sys",
++]
++
++[[package]]
++name = "serde"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
++dependencies = [
++ "serde_core",
++]
++
++[[package]]
++name = "serde_core"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
++dependencies = [
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_derive"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn",
++]
++
++[[package]]
++name = "serde_json"
++version = "1.0.154"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
++dependencies = [
++ "itoa",
++ "memchr",
++ "serde",
++ "serde_core",
++ "zmij",
++]
++
++[[package]]
++name = "strsim"
++version = "0.11.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
++
++[[package]]
++name = "syn"
++version = "3.0.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d78c8dee4c7bf0e14673097256fed6142ce9d3b85a408189d07482442145823b"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "tempfile"
++version = "3.27.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
++dependencies = [
++ "fastrand",
++ "getrandom",
++ "once_cell",
++ "rustix",
++ "windows-sys",
++]
++
++[[package]]
++name = "unicode-ident"
++version = "1.0.27"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
++
++[[package]]
++name = "utf8parse"
++version = "0.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
++
++[[package]]
++name = "voxtype-result-json-tests"
++version = "0.0.0"
++dependencies = [
++ "anyhow",
++ "clap",
++ "libc",
++ "serde_json",
++ "tempfile",
++]
++
++[[package]]
++name = "windows-link"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
++
++[[package]]
++name = "windows-sys"
++version = "0.61.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
++dependencies = [
++ "windows-link",
++]
++
++[[package]]
++name = "zmij"
++version = "1.0.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+diff --git 1/tests/result-json-harness/result_json.rs 2/tests/result-json-harness/result_json.rs
+new file mode 100644
+index 0000000..e651d3b
+--- /dev/null
++++ 2/tests/result-json-harness/result_json.rs
+@@ -0,0 +1,2 @@
++#[path = "../../src/app/result_json.rs"]
++mod result_json;
+diff --git 1/tests/result-json-harness/cli.rs 2/tests/result-json-harness/cli.rs
+new file mode 100644
+index 0000000..b89c1fb
+--- /dev/null
++++ 2/tests/result-json-harness/cli.rs
+@@ -0,0 +1,31 @@
++#[allow(dead_code, unused_imports)]
++#[path = "../../src/cli/mod.rs"]
++mod cli;
++
++use clap::Parser;
++
++#[test]
++fn result_json_option_is_explicitly_accepted_for_each_local_engine() {
++    for engine in ["whisper", "parakeet"] {
++        assert!(
++            cli::Cli::try_parse_from([
++                "voxtype",
++                "transcribe",
++                "generated.wav",
++                "--engine",
++                engine,
++                "--result-json",
++                "/private/job/result.json"
++            ])
++            .is_ok(),
++            "--result-json must be recognized for {engine}"
++        );
++    }
++}
++
++#[test]
++fn result_json_option_is_not_accepted_for_daemon() {
++    assert!(
++        cli::Cli::try_parse_from(["voxtype", "daemon", "--result-json", "result.json"]).is_err()
++    );
++}
+diff --git 1/tests/result-json-harness/check_binary.py 2/tests/result-json-harness/check_binary.py
+new file mode 100644
+index 0000000..ff72b8a
+--- /dev/null
++++ 2/tests/result-json-harness/check_binary.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++"""Check the real CLI failure boundary without loading a model or recording audio."""
++from pathlib import Path
++import json
++import subprocess
++import sys
++import tempfile
++import wave
++
++
++def main() -> None:
++    binary = Path(sys.argv[1]).resolve(strict=True)
++    checks = []
++    with tempfile.TemporaryDirectory(prefix="voxtype-protocol-check-") as directory:
++        job = Path(directory)
++        job.chmod(0o700)
++        config = job / "config.toml"
++        config.write_text(f'''engine = "whisper"
++[whisper]
++model = "{job / 'absent-model.bin'}"
++mode = "local"
++gpu_isolation = false
++[vad]
++enabled = false
++[parakeet]
++model = "{job / 'absent-parakeet-model'}"
++model_type = "tdt"
++''')
++        config.chmod(0o600)
++        result = job / "result.json"
++        absent_audio = job / "absent.wav"
++
++        def invoke(audio: Path, engine: str = "whisper", cfg: Path = config) -> subprocess.CompletedProcess:
++            process = subprocess.run(
++                [str(binary), "--config", str(cfg), "transcribe", str(audio),
++                 "--engine", engine, "--result-json", str(result)],
++                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                timeout=15, check=False,
++            )
++            assert process.returncode != 0, "failed job returned success"
++            assert process.stdout == b"", "machine-mode diagnostics escaped to stdout"
++            return process
++
++        help_result = subprocess.run([str(binary), "transcribe", "--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
++        assert help_result.returncode == 0 and b"--result-json" in help_result.stdout
++        checks.append("result option in file-command help")
++
++        invoke(absent_audio)
++        assert not result.exists()
++        checks.append("missing input leaves no artifact or stdout")
++
++        result.write_bytes(b"preserve existing result")
++        process = invoke(absent_audio)
++        assert b"result destination already exists" in process.stderr
++        assert result.read_bytes() == b"preserve existing result"
++        result.unlink()
++        checks.append("existing destination preserved before input load")
++
++        remote = job / "remote.toml"
++        remote.write_text(config.read_text().replace('mode = "local"', 'mode = "remote"'))
++        process = invoke(absent_audio, cfg=remote)
++        assert b"requires whisper mode = local" in process.stderr and not result.exists()
++        checks.append("remote mode rejected before input/model/network use")
++
++        process = invoke(absent_audio, engine="soniox")
++        assert b"supports only local whisper and parakeet" in process.stderr and not result.exists()
++        checks.append("unsupported engine rejected before backend use")
++
++        invalid = job / "invalid.wav"
++        invalid.write_bytes(b"generated non-WAV input")
++        invoke(invalid)
++        assert not result.exists()
++        checks.append("invalid WAV leaves no artifact")
++
++        generated = job / "generated-silence.wav"
++        with wave.open(str(generated), "wb") as audio:
++            audio.setnchannels(1)
++            audio.setsampwidth(2)
++            audio.setframerate(16000)
++            audio.writeframes(b"\0\0" * 160)
++        for engine in ("whisper", "parakeet"):
++            process = invoke(generated, engine=engine)
++            assert b"model" in process.stderr.lower(), "expected a missing-model error"
++            assert not result.exists()
++            checks.append(f"{engine} missing model fails without artifact")
++
++        legacy = subprocess.run([str(binary), "--config", str(config), "transcribe", str(absent_audio)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
++        assert legacy.returncode != 0 and b"Loading audio file:" in legacy.stdout
++        checks.append("legacy human CLI keeps stdout banner")
++        assert not list(job.glob(".voxtype-result-*")), "failure left a temporary result"
++    print(json.dumps({"schemaVersion": 1, "checksPassed": len(checks), "checks": checks, "recognitionRun": False}))
++
++
++if __name__ == "__main__":
++    main()
+diff --git 1/tests/result-json-harness/test_build_monitor.py 2/tests/result-json-harness/test_build_monitor.py
+new file mode 100644
+index 0000000..f0c762b
+--- /dev/null
++++ 2/tests/result-json-harness/test_build_monitor.py
+@@ -0,0 +1,68 @@
++"""Deterministic filesystem-race checks for the app-owned build monitor."""
++import importlib.util
++from pathlib import Path
++import sys
++import tempfile
++import unittest
++from unittest.mock import patch
++
++location = Path(sys.argv.pop(1)) if len(sys.argv) > 1 else Path(__file__).resolve().parents[4] / "tools/build_engine.py"
++spec = importlib.util.spec_from_file_location("build_engine", location)
++build_engine = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(build_engine)
++
++
++class DiskMonitorTests(unittest.TestCase):
++    def test_file_disappearing_during_checkout_is_ignored(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            vanishing = root / "vanishing"
++            vanishing.write_bytes(b"123")
++            original = Path.is_file
++            removed = False
++
++            def is_file_then_remove(path, *args, **kwargs):
++                nonlocal removed
++                result = original(path, *args, **kwargs)
++                if path == vanishing and result and not removed:
++                    removed = True
++                    vanishing.unlink()
++                return result
++
++            failure = None
++            size = None
++            with patch.object(Path, "is_file", is_file_then_remove):
++                try:
++                    size = build_engine.disk_bytes(root)
++                except FileNotFoundError as error:
++                    failure = error
++            self.assertTrue(removed, "race was exercised")
++            self.assertIsNone(failure, "disk monitor must tolerate a file removed during checkout")
++            self.assertEqual(size, 0)
++
++    def test_existing_files_are_counted_and_symlinks_are_excluded(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            (root / "data").write_bytes(b"1234")
++            (root / "link").symlink_to(root / "data")
++            self.assertEqual(build_engine.disk_bytes(root), 4)
++
++    def test_other_io_errors_are_preserved(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            target = root / "data"
++            target.write_bytes(b"1234")
++            original = Path.stat
++
++            def denied(path, *args, **kwargs):
++                if path == target:
++                    raise PermissionError("synthetic denied file")
++                return original(path, *args, **kwargs)
++
++            with patch.object(Path, "stat", denied):
++                with self.assertRaises(PermissionError):
++                    build_engine.disk_bytes(root)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+.env*
+*.wav
+*.mp3
+*.onnx
+*.gguf
+*.bin
+*.db
+*.sqlite*
+vendor/

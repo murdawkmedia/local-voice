@@ -1,0 +1,2 @@
+# Preserve the exact qualified patch, whose blank context lines contain one space.
+patches/*.patch -whitespace
