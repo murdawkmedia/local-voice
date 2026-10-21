@@ -10,6 +10,17 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
+      - name: Install desktop test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libdbus-1-3 dbus-user-session
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@$(id -u).service"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+      - name: Verify required isolation and memory scopes
+        run: |
+          unshare --user --map-root-user --net true
+          systemd-run --user --scope --quiet -p MemoryMax=2G true
       - run: python -m pip install -e .
       - run: python -m unittest discover -s tests
         env:
