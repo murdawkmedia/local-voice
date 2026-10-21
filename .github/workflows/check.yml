@@ -19,6 +19,9 @@ jobs:
           echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
       - name: Verify required isolation and memory scopes
         run: |
+          # This disposable runner needs the same user/network namespace support
+          # required on a supported desktop. The application never relaxes it.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           unshare --user --map-root-user --net true
           systemd-run --user --scope --quiet -p MemoryMax=2G true
       - run: python -m pip install -e .
