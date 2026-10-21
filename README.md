@@ -71,7 +71,7 @@ Original and edited transcript text remain available after audio deletion.
 
 ## Source, contributions and license
 
-Nostr is the primary repository transport; GitHub is a mirror at
+[Nostr source](https://gitworkshop.dev/npub17j3f7cuhcvjqnf7d80x6rt9hmkkhdguwg4l2th0h4qnhqketr63s6xakwv/relay.ngit.dev/local-voice) is primary; GitHub is a mirror at
 [murdawkmedia/local-voice](https://github.com/murdawkmedia/local-voice).
 The separate Android app is at
 [local-voice-android](https://github.com/murdawkmedia/local-voice-android).
