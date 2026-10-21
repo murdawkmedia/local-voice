@@ -8,30 +8,97 @@ _LITERALS = re.compile(
     r"(?<!\w)'[^'\n]*'(?!\w)|https?://[^\s]+|[^\s]+@[^\s]+")
 _HESITATIONS = re.compile(r'(?<![\w./@\\\-\'’])(?:[Uu]m{1,3}|[Uu]h{1,3}|[Uu]hm{1,2}|ah{1,3})(?![\w/@\\\-\'’])')
 
-_SPOKEN_EMAIL = re.compile(
-    r'(?<![\w./@+%\\-])([a-z0-9_+%-]+(?:\.[a-z0-9_+%-]+)*)[ \t]+at[ \t]+'
-    r'((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63})'
-    r'(?![\w/@\\-]|\.[\w-])', re.IGNORECASE)
+_EMAIL_AT = re.compile(r'\bat(?:[ \t,;:]+(?:sign|symbol))?\b|@', re.IGNORECASE)
+_LABEL = r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
+_DOMAIN_DOT = r'(?:\.(?=[a-z0-9])|[ \t]+\.[ \t]+|[ \t,;:]+(?:dot|period)[ \t,;:]+)'
+_EMAIL_DOMAIN = re.compile(_LABEL + '(?:' + _DOMAIN_DOT + _LABEL + r')+(?![\w/@\\-]|\.[\w-])', re.IGNORECASE)
+_LOCAL_ATOM = r"[a-z0-9!#$%&'*+/=?^_`{|}~-]+"
+_LOCAL_SYMBOL = r'[ \t,;:]+(dot|period|underscore|under[ \t]+score|dash|hyphen|plus)(?:[ \t]+(?:sign|symbol))?[ \t,;:]+'
+_LOCAL_TAIL = re.compile(r'(?<![\w./@+%\\-])(' + _LOCAL_ATOM + '(?:(?:' + _LOCAL_SYMBOL +
+                         r'|[ \t]*\.[ \t]*|[ \t]+[_+-][ \t]+)' + _LOCAL_ATOM + r'){0,16})$', re.IGNORECASE)
+_EMAIL_LEAD = re.compile(r'\b(?:e-?mail(?:[ \t]+address)?(?:[ \t]+is)?|address[ \t]+is|'
+                         r'send(?:[ \t]+(?:it|this|that))?[ \t]+to|reply[ \t]+to|contact|'
+                         r'use|say|type)[ \t:]+', re.IGNORECASE)
+_SYMBOLS = {'dot': '.', 'period': '.', 'underscore': '_', 'under score': '_',
+            'dash': '-', 'hyphen': '-', 'plus': '+'}
 # These usually introduce a website/location, not an email local part. An exact
 # private dictionary replacement can resolve an intentionally ambiguous address.
 _LOCATION_WORDS = frozenset('at look meet meeting us me you them it this that here there '
                             'online available located visit website site found more details '
-                            'see read work working arrive arriving stay staying back home'.split())
+                            'see read work working arrive arriving stay staying back home '
+                            'is are was were be i we they and to my email address please the '
+                            'can will with from hello thanks information'.split())
+
+
+def _email_local(raw, *, words):
+    value = re.sub(_LOCAL_SYMBOL, lambda m: _SYMBOLS[re.sub(r'[ \t]+', ' ', m[1].lower())],
+                   raw, flags=re.IGNORECASE)
+    value = re.sub(r'[ \t]*([._+-])[ \t]*', r'\1', value)
+    if not words and re.search(r'\s', value):
+        return None
+    tokens = value.split()
+    if not tokens or len(tokens) > 4 or any(t.casefold() in _LOCATION_WORDS for t in tokens):
+        return None
+    value = ''.join(tokens)
+    return value if len(value) <= 64 and re.fullmatch(_LOCAL_ATOM + '(?:\\.' + _LOCAL_ATOM + ')*', value, re.IGNORECASE) else None
+
+
+def _email_local_before(text, end):
+    base = max(0, end - 512)
+    left = text[base:end]
+    newline = left.rfind('\n') + 1
+    base += newline
+    left = left[newline:].rstrip(' \t,;:.')
+    sentences = list(re.finditer(r'(?<![ \t])[.!?][ \t]+', left))
+    if sentences:
+        offset = sentences[-1].end()
+        base += offset
+        left = left[offset:]
+    leads = list(_EMAIL_LEAD.finditer(left))
+    start = leads[-1].end() if leads else 0
+    raw = left[start:]
+    local = _email_local(raw, words=True)
+    if local and not _EMAIL_AT.search(raw):
+        return base + start, local
+    # A website location following a verb must not become a person's email.
+    if not leads and re.search(r'\b(?:look|meet|visit|work|located|available|learn|read|see|find)\b[^.!?\n]*$', left, re.IGNORECASE):
+        return None
+    tail = _LOCAL_TAIL.search(left)
+    if tail and (local := _email_local(tail[1], words=False)):
+        return base + tail.start(1), local
+    return None
 
 
 def format_spoken_emails(text):
-    """Format explicit word-separated email 'at'; never split joined domains.
+    """Normalize spoken address punctuation/symbols without a provider list.
 
     Keep literal/code/URL spans and common location prose unchanged. This is
     deterministic punctuation formatting, independent of hesitation cleanup.
     """
     literals = [m.span() for m in _LITERALS.finditer(text)]
-    def replace(match):
-        if (match[1].casefold() in _LOCATION_WORDS or
-                any(left < match.end() and match.start() < right for left, right in literals)):
-            return match[0]
-        return match[1] + '@' + match[2]
-    return _SPOKEN_EMAIL.sub(replace, text)
+    parts, cursor = [], 0
+    for marker in _EMAIL_AT.finditer(text):
+        if marker.start() < cursor:
+            continue
+        gap = re.match(r'(?:[ \t,;:]|\.(?=[ \t]))*', text[marker.end():])
+        right = marker.end() + gap.end()
+        domain = _EMAIL_DOMAIN.match(text, right, min(len(text), right + 512))
+        if not domain:
+            continue
+        normalized = re.sub(_DOMAIN_DOT, '.', domain[0], flags=re.IGNORECASE).lower()
+        if len(normalized) > 253 or not re.fullmatch('(?:' + _LABEL + r'\.)+[a-z]{2,63}', normalized):
+            continue
+        local = _email_local_before(text, marker.start())
+        if local is None:
+            continue
+        start, value = local
+        if (start < cursor or (start and re.match(r'[\w./@+%\\-]', text[start-1])) or
+                any(left < domain.end() and start < end for left, end in literals)):
+            continue
+        parts.extend([text[cursor:start], value + '@' + normalized])
+        cursor = domain.end()
+    parts.append(text[cursor:])
+    return ''.join(parts)
 
 
 def clean_hesitations(text):

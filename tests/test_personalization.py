@@ -1,9 +1,17 @@
 import importlib
 import importlib.util
+import subprocess
+import sys
 import unittest
 
 
 class PersonalizationTests(unittest.TestCase):
+    def test_malformed_repeated_local_symbols_do_not_stall_dictation(self):
+        script = ("from local_voice.personalization import format_spoken_emails as f; "
+                  "text='a+'*220+'?\\\" at example.com'; assert f(text)==text")
+        result = subprocess.run([sys.executable, '-c', script], capture_output=True, timeout=2)
+        self.assertEqual(result.returncode, 0)
+
     def setUp(self):
         self.assertIsNotNone(importlib.util.find_spec('local_voice.personalization'),
                              'Literal private personalization is not implemented')
@@ -41,6 +49,68 @@ class PersonalizationTests(unittest.TestCase):
                 ('alex.smith+work AT mail.example.org, thanks.', 'alex.smith+work@mail.example.org, thanks.'),
                 ('Email alex at example.com and sam at example.org.', 'Email alex@example.com and sam@example.org.')]:
             self.assertEqual(self.module.apply_personalization(raw, {}), (expected, raw))
+
+    def test_spoken_email_tolerates_recognizer_pause_punctuation_for_any_domain(self):
+        for raw, expected in [
+                ('AcmeStudio, at example.com.', 'AcmeStudio@example.com.'),
+                ('alex, at, EXAMPLE.org!', 'alex@example.org!'),
+                ('AcmeStudio. At example.net.', 'AcmeStudio@example.net.'),
+                ('Email sam; at sign; mail.example.co.uk, thanks.', 'Email sam@mail.example.co.uk, thanks.'),
+                ('alex at symbol example.museum', 'alex@example.museum'),
+                ('alex @ example.com', 'alex@example.com')]:
+            with self.subTest(raw=raw):
+                self.assertEqual(self.module.apply_personalization(raw, {}), (expected, raw))
+
+    def test_spoken_email_symbols_and_domain_dots_are_local_to_address(self):
+        for raw, expected in [
+                ('alex dot smith at example dot com.', 'alex.smith@example.com.'),
+                ('Alex, dot, Smith, at, Example, dot, Co, dot, UK.', 'Alex.Smith@example.co.uk.'),
+                ('first underscore last at mail dot example dot org', 'first_last@mail.example.org'),
+                ('first dash last plus work at example dot net', 'first-last+work@example.net'),
+                ('team + updates at example . com', 'team+updates@example.com'),
+                ('Email sam at example dot com and pat at example.org.', 'Email sam@example.com and pat@example.org.')]:
+            with self.subTest(raw=raw):
+                self.assertEqual(self.module.apply_personalization(raw, {}), (expected, raw))
+
+    def test_spoken_email_multiword_names_keep_prose_outside_address(self):
+        for raw, expected in [
+                ('Acme Studio, at example.com.', 'AcmeStudio@example.com.'),
+                ('Contact Acme Studio, at example.com.', 'Contact AcmeStudio@example.com.'),
+                ('Please send to sales team, at example.org.', 'Please send to salesteam@example.org.'),
+                ('My email address is alex smith at example.com.', 'My email address is alexsmith@example.com.')]:
+            with self.subTest(raw=raw):
+                self.assertEqual(self.module.apply_personalization(raw, {}), (expected, raw))
+
+    def test_email_keeps_previous_sentences_and_address_instruction_words(self):
+        for raw, expected in [
+                ('Thank you. alex at example.com.', 'Thank you. alex@example.com.'),
+                ('That was great! Alex at example.com.', 'That was great! Alex@example.com.'),
+                ('Use Acme Studio, at example.com.', 'Use AcmeStudio@example.com.'),
+                ('Say alex, at example.com.', 'Say alex@example.com.')]:
+            with self.subTest(raw=raw):
+                self.assertEqual(self.module.apply_personalization(raw, {}), (expected, raw))
+
+    def test_private_brand_correction_applies_after_email_normalization_without_rewriting_people(self):
+        profile = {'words': ['AcmeStudio'], 'replacements': {'AckmeStudio': 'AcmeStudio',
+                    'Ackme Studio': 'AcmeStudio', 'ackme@example.com': 'AcmeStudio@example.com'}}
+        for raw, expected in [
+                ('Ackme Studio, at example.com.', 'AcmeStudio@example.com.'),
+                ('AckmeStudio, at example.org.', 'AcmeStudio@example.org.'),
+                ('Ackme at example.com.', 'AcmeStudio@example.com.'),
+                ('Ackme met Alex at the studio.', 'Ackme met Alex at the studio.')]:
+            self.assertEqual(self.module.apply_personalization(raw, profile), (expected, raw))
+
+    def test_email_normalization_preserves_literals_malformed_addresses_and_location_prose(self):
+        for raw in ['Type "alex, at example dot com" or `alex at example.com`.',
+                    '```alex, at example.com```', 'https://example.com/alex at example.org',
+                    'I work at example.com.', 'Details are at example.com.',
+                    'Meet Alice at example.com.', 'Look, at example.com.',
+                    'alex..smith at example.com', 'alex at bad-.com',
+                    'alex at example dot c', 'alex at -bad.com',
+                    'The dot and underscore words stay here.', 'contactsite.com',
+                    'alex@example.com', 'alex@example.com. Please look at example.org.']:
+            with self.subTest(raw=raw):
+                self.assertEqual(self.module.apply_personalization(raw, {}), (raw, raw))
 
     def test_spoken_email_keeps_literals_websites_and_ordinary_prose(self):
         for raw in ['Open contactsite.com or atlassian.com.', 'Look at example.com.',

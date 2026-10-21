@@ -132,6 +132,23 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(until(lambda: bool(self.captures)))
         return sid, self.captures[-1]
 
+    def test_spoken_email_and_private_name_correction_save_original_and_purge_successful_audio(self):
+        raw = 'Ackme Studio, at example dot com.'
+        self.store.save_dictionary_entry(word='AckmeStudio', replacement='AcmeStudio')
+        self.store.save_dictionary_entry(word='AcmeStudio')
+        self.engine.transcribe = lambda path, cancel: raw
+        value = self.make(cleanup_provider=lambda: False)
+        sid, capture = self.started_capture(value)
+        capture.append('microphone', 481)
+        self.assertTrue(until(lambda: value.status()['state'] == 'recording'))
+        value.stop()
+        self.assertTrue(value.wait_idle(4))
+        row = Store(self.root / 'state/history.db').get_session(sid)
+        self.assertEqual((row['state'], row['audio_state']), ('complete', 'removed'))
+        self.assertEqual(row['segments'][0]['text'], 'AcmeStudio@example.com.')
+        self.assertEqual(row['segments'][0]['raw_text'], raw)
+        self.assertEqual(list(capture.directory.rglob('*.wav')), [])
+
     def test_early_stop_is_published_while_source_setup_blocks_and_never_makes_tiny_job(self):
         entered = threading.Event()
         release = threading.Event()

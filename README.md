@@ -10,7 +10,7 @@ optional and local. Successful audio is removed after nonempty text is saved;
 failed or interrupted attempts keep audio for Retry. No account, telemetry or
 cloud fallback is used. The app never presses Enter or changes Bluetooth profiles.
 
-This is an early source release, **0.1.0.dev7**, developed on a Hyprland/systemd/
+This is an early source release, **0.1.0.dev8**, developed on a Hyprland/systemd/
 PipeWire desktop. There is no general-purpose binary installer yet. Other desktops,
 distributions and hardware need testing. Initial model/GPU loading may take time;
 the readiness cue reports actual audio arrival, rather than promising instant capture.
@@ -101,7 +101,12 @@ journaled before changes and checked on restoration; manual software-gain change
 recovery remains private until the same output returns. Old per-stream recovery
 is read before new lowering; normal gain is never guessed.
 
-Spoken email punctuation formats `alex at example.com` as `alex@example.com`.
-Quoted/code text and common website-location phrases stay literal. Joined forms
-need an exact private dictionary correction; website names are never split by guessing.
-The original recognition remains saved, and snippets expand exactly as written.
+Spoken email formatting accepts pauses such as `AcmeStudio, at example.com`,
+`at sign`, `at symbol`, spoken `dot`, `underscore`, `hyphen` and `plus`. It formats
+addresses across domains without a provider list. Plain multiword local names join
+in an isolated address or clear lead-in such as `email address is` or `send to`.
+Quoted/code/URL text, existing addresses, malformed domains and common website
+location phrases stay literal. Joined forms without an explicit at marker need an
+exact private dictionary correction; website names are never split by guessing.
+Names and homophones use your local dictionary and speech hints, rather than a
+universal name rewrite. Original recognition and exact snippets remain preserved.
