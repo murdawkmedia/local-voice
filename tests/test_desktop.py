@@ -30,12 +30,17 @@ class DesktopTests(unittest.TestCase):
                              'Guarded desktop integration is not implemented')
         self.module = importlib.import_module('local_voice.desktop')
         self.calls = []
-        self.target = {'address': '0x123', 'class': 'GeneratedEditor'}
+        self.target = {'address': '0x123', 'class': 'GeneratedEditor', 'pid': os.getpid(),
+                       'start': int(Path('/proc/self/stat').read_text().rpartition(')')[2].split()[19])}
 
     def runner(self, argv, **kwargs):
         self.calls.append((argv, kwargs))
-        if argv[0] == 'hyprctl':
-            return json.dumps(self.target).encode()
+        if argv[:3] == ['hyprctl', '-j', 'activewindow']:
+            return json.dumps(dict(self.target, mapped=True, hidden=False, visible=True, acceptsInput=True, xwayland=False)).encode()
+        if argv[:3] == ['hyprctl', '-j', 'getprop']:
+            return b'{"no_focus":false}'
+        if argv[:2] == ['hyprctl', 'dispatch']:
+            return b'ok\n'
         return b''
 
     def test_copy_uses_stdin_and_never_reads_clipboard(self):
@@ -53,9 +58,24 @@ class DesktopTests(unittest.TestCase):
         self.assertTrue(result['copied'])
         self.assertTrue(result['pasted'])
         commands = [call[0] for call in self.calls]
-        self.assertEqual(commands[-1], ['wtype', '-M', 'ctrl', '-k', 'v', '-m', 'ctrl'])
+        self.assertEqual(commands[-1][:2], ['hyprctl', 'dispatch'])
+        self.assertIn('hl.dsp.send_shortcut', commands[-1][2])
         self.assertNotIn('Return', str(commands))
         self.assertNotIn('Enter', str(commands))
+
+    def test_zero_exit_wayland_protocol_failure_never_reports_paste_success(self):
+        # wtype can exit zero after a compositor protocol error. Its process
+        # status alone does not establish even successful key submission.
+        def protocol_failure(argv, **kwargs):
+            if argv[0] == 'wtype' or argv[:2] == ['hyprctl', 'dispatch']:
+                return self.module.run_command([sys.executable, '-c',
+                    'import sys; sys.stderr.write("wl_display#1: error 2: no memory\\n")'], **kwargs)
+            return self.runner(argv, **kwargs)
+        result = self.module.DesktopOutput(runner=protocol_failure,
+            modifiers_held=lambda: False).deliver('Generated phrase', self.target)
+        self.assertTrue(result['copied'])
+        self.assertFalse(result['pasted'])
+        self.assertEqual(result['reason'], 'paste-unavailable')
 
     def test_changed_address_or_class_retains_copy_without_key_injection(self):
         for captured in (None, {'address': '0x999', 'class': self.target['class']},
@@ -66,6 +86,7 @@ class DesktopTests(unittest.TestCase):
             self.assertTrue(result['copied'])
             self.assertFalse(result['pasted'])
             self.assertNotIn('wtype', [call[0][0] for call in self.calls])
+            self.assertFalse(any(call[0][:2] == ['hyprctl', 'dispatch'] for call in self.calls))
 
     def test_disabled_auto_paste_and_paste_failure_keep_clipboard(self):
         output = self.module.DesktopOutput(runner=self.runner, modifiers_held=lambda: False)
@@ -73,7 +94,7 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual(result['reason'], 'copied')
         self.assertEqual(len(self.calls), 1)
         def failing(argv, **kwargs):
-            if argv[0] == 'wtype':
+            if argv[0] == 'wtype' or argv[:2] == ['hyprctl', 'dispatch']:
                 raise self.module.DesktopError('paste-unavailable')
             return self.runner(argv, **kwargs)
         result = self.module.DesktopOutput(runner=failing, modifiers_held=lambda: False).deliver('Generated', self.target)
@@ -94,7 +115,8 @@ class DesktopTests(unittest.TestCase):
         self.target['class'] = 'com.mitchellh.ghostty'
         output = self.module.DesktopOutput(runner=self.runner, modifiers_held=lambda: False)
         output.deliver('Generated', self.target)
-        self.assertEqual(self.calls[-1][0], ['wtype', '-M', 'ctrl', '-M', 'shift', '-k', 'v', '-m', 'shift', '-m', 'ctrl'])
+        self.assertEqual(self.calls[-1][0][:2], ['hyprctl', 'dispatch'])
+        self.assertIn('mods = "CTRL SHIFT"', self.calls[-1][0][2])
         self.calls.clear()
         output = self.module.DesktopOutput(runner=self.runner, modifiers_held=lambda: True,
                                            modifier_timeout=0.01)
@@ -106,10 +128,10 @@ class DesktopTests(unittest.TestCase):
         checks = []
         def changes_focus():
             checks.append(1)
-            self.target = {'address': '0x456', 'class': 'OtherEditor'}
+            self.target = dict(self.target, address='0x456', **{'class': 'OtherEditor'})
             return False
         output = self.module.DesktopOutput(runner=self.runner, modifiers_held=changes_focus)
-        result = output.deliver('Generated', {'address': '0x123', 'class': 'GeneratedEditor'})
+        result = output.deliver('Generated', dict(self.target))
         self.assertEqual(result['reason'], 'focus-changed')
         self.assertFalse(result['pasted'])
 

@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import re
 from pathlib import Path
 import selectors
 import signal
@@ -16,7 +17,7 @@ class DesktopError(RuntimeError):
         super().__init__(category)
 
 
-def run_command(argv, *, input=None, env=None, timeout=3, maximum=1_048_576, capture=True):
+def run_command(argv, *, input=None, env=None, timeout=3, maximum=1_048_576, capture=True, reject_stderr=False):
     """No shell, bounded stdout/time, no retained stderr or transcript arguments."""
     if not math.isfinite(timeout) or not 0 < timeout <= 10 or not 0 <= maximum <= 4_194_304:
         raise ValueError('Invalid command bounds')
@@ -31,7 +32,10 @@ def run_command(argv, *, input=None, env=None, timeout=3, maximum=1_048_576, cap
     try:
         process = subprocess.Popen(argv, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
                                    stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+                                   stderr=subprocess.PIPE if reject_stderr else subprocess.DEVNULL, env=env, start_new_session=True)
+        if process.stderr is not None:
+            os.set_blocking(process.stderr.fileno(), False)
+            selector.register(process.stderr, selectors.EVENT_READ)
         if process.stdout is not None:
             os.set_blocking(process.stdout.fileno(), False)
             selector.register(process.stdout, selectors.EVENT_READ)
@@ -49,7 +53,14 @@ def run_command(argv, *, input=None, env=None, timeout=3, maximum=1_048_576, cap
                 process.wait(timeout=remaining)
                 break
             for key, events in selector.select(min(remaining, 0.1)):
-                if events & selectors.EVENT_READ:
+                if key.fileobj is process.stderr:
+                    # Wayland clients can return zero after a protocol error.
+                    # Reject any diagnostic without retaining or exposing it.
+                    if os.read(key.fd, 1):
+                        raise DesktopError('command-diagnostic')
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                elif events & selectors.EVENT_READ:
                     try:
                         data = os.read(key.fd, min(65_536, maximum + 1 - len(output)))
                     except BlockingIOError:
@@ -85,7 +96,7 @@ def run_command(argv, *, input=None, env=None, timeout=3, maximum=1_048_576, cap
                     pass
             if process.poll() is None:
                 process.wait(timeout=1)
-            for stream in (process.stdin, process.stdout):
+            for stream in (process.stdin, process.stdout, process.stderr):
                 if stream is not None:
                     stream.close()
 
@@ -206,6 +217,31 @@ _TERMINALS = ('alacritty', 'ghostty', 'kitty', 'foot', 'wezterm', 'xterm', 'gnom
               'org.gnome.terminal', 'blackbox', 'konsole', 'org.omarchy.terminal')
 
 
+def _process_start(pid):
+    if type(pid) is not int or not 0 < pid < 2**31:
+        return None
+    try:
+        with (Path('/proc') / str(pid) / 'stat').open('rb') as stream:
+            raw = stream.read(4097)
+        if len(raw) > 4096:
+            return None
+        return int(raw.rpartition(b')')[2].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _focus_identity(value):
+    if not isinstance(value, dict):
+        return None
+    address, app, pid, start = (value.get(k) for k in ('address', 'class', 'pid', 'start'))
+    if (not isinstance(address, str) or not re.fullmatch(r'0x[0-9a-fA-F]{1,16}', address)
+            or int(address, 16) == 0 or not isinstance(app, str) or not 0 < len(app) <= 512
+            or type(pid) is not int or not 0 < pid < 2**31
+            or type(start) is not int or start <= 0):
+        return None
+    return {'address': address, 'class': app, 'pid': pid, 'start': start}
+
+
 class DesktopOutput:
     def __init__(self, *, runner=run_command, modifiers_held=physical_modifiers_held, modifier_timeout=0.3):
         if not 0 <= modifier_timeout <= 1:
@@ -228,14 +264,22 @@ class DesktopOutput:
 
     def focus(self):
         try:
-            value = json.loads(self.runner(['hyprctl', '-j', 'activewindow'], maximum=65_536))
-            if not isinstance(value, dict):
+            value = json.loads(self.runner(['hyprctl', '-j', 'activewindow'],
+                                           timeout=1, maximum=65_536))
+            if (not isinstance(value, dict) or value.get('mapped') is not True
+                    or value.get('hidden') is not False or value.get('visible') is not True
+                    or value.get('acceptsInput') is not True or value.get('xwayland') is not False):
                 return None
-            address, app = value.get('address'), value.get('class')
-            if (not isinstance(address, str) or not address or address == '0x0' or len(address) > 128
-                    or not isinstance(app, str) or not app or len(app) > 512):
+            target = _focus_identity(dict(value, start=_process_start(value.get('pid'))))
+            if target is None:
                 return None
-            return {'address': address, 'class': app}
+            # send_shortcut can address a background surface. Never use it to
+            # bypass a window's no_focus policy, even if activewindow is stale.
+            policy = json.loads(self.runner(['hyprctl', '-j', 'getprop',
+                                'address:' + target['address'], 'no_focus'],
+                                timeout=1, maximum=4096))
+            return target if (isinstance(policy, dict) and policy.keys() == {'no_focus'}
+                              and policy['no_focus'] is False) else None
         except (DesktopError, ValueError, TypeError, OSError):
             return None
 
@@ -249,12 +293,10 @@ class DesktopOutput:
         result['reason'] = 'copied'
         if not auto_paste:
             return result
-        target = captured_focus
-        if (not isinstance(target, dict) or not isinstance(target.get('address'), str)
-                or not isinstance(target.get('class'), str) or not target['address'] or not target['class']):
+        target = _focus_identity(captured_focus)
+        if target is None:
             result['reason'] = 'missing-focus'
             return result
-        target = {'address': target['address'], 'class': target['class']}
         if self.focus() != target:
             result['reason'] = 'focus-changed'
             return result
@@ -283,16 +325,26 @@ class DesktopOutput:
         except Exception:
             result['reason'] = 'modifiers-unavailable'
             return result
-        argv = ['wtype', '-M', 'ctrl']
-        terminal = any(name in target['class'].casefold() for name in _TERMINALS)
-        if terminal:
-            argv += ['-M', 'shift']
-        argv += ['-k', 'v']
-        if terminal:
-            argv += ['-m', 'shift']
-        argv += ['-m', 'ctrl']
+        # Select the native route before any injection. There is no retry or
+        # alternate key transport after a possibly partial dispatch.
+        mods = 'CTRL SHIFT' if any(name in target['class'].casefold() for name in _TERMINALS) else 'CTRL'
+        address = json.dumps(target['address'])
+        selector = json.dumps('address:' + target['address'])
+        # Only regex-validated hex, a validated integer PID and fixed literals
+        # enter Lua. Transcript and application class never enter code/argv.
+        # The compositor rechecks active identity in the same transaction as
+        # dispatch, closing the IPC gap after the Python focus/modifier checks.
+        expression = ('(function() local w = hl.get_active_window(); '
+            'if not w or w.address ~= ' + address + ' or w.pid ~= ' + str(target['pid'])
+            + ' or not w.mapped or w.hidden or not w.accepts_input then '
+            'error("paste-focus-changed") end; '
+            'return hl.dsp.send_shortcut({ mods = "' + mods + '", key = "v", window = '
+            + selector + ' }) end)()')
         try:
-            self.runner(argv, capture=False)
+            response = self.runner(['hyprctl', 'dispatch', expression], timeout=2,
+                                   maximum=4096, reject_stderr=True)
+            if not isinstance(response, bytes) or response.strip() != b'ok':
+                raise DesktopError('paste-unavailable')
             result.update(pasted=True, reason='pasted')
         except (DesktopError, OSError):
             result['reason'] = 'paste-unavailable'

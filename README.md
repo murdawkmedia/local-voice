@@ -10,7 +10,7 @@ optional and local. Successful audio is removed after nonempty text is saved;
 failed or interrupted attempts keep audio for Retry. No account, telemetry or
 cloud fallback is used. The app never presses Enter or changes Bluetooth profiles.
 
-This is an early source release, **0.1.0.dev8**, developed on a Hyprland/systemd/
+This is an early source release, **0.1.0.dev10**, developed on a Hyprland/systemd/
 PipeWire desktop. There is no general-purpose binary installer yet. Other desktops,
 distributions and hardware need testing. Initial model/GPU loading may take time;
 the readiness cue reports actual audio arrival, rather than promising instant capture.
@@ -19,11 +19,16 @@ the readiness cue reports actual audio arrival, rather than promising instant ca
 
 Requirements: Linux, Python 3.11+, systemd user scopes, unprivileged user/network
 namespaces, PipeWire with PulseAudio compatibility (`parec`, `pactl`), native PipeWire tools (`pw-cli`, `pw-dump`), `wl-copy`,
-`wtype`, `notify-send`, and Hyprland's `hyprctl` for guarded automatic insertion.
+`notify-send`, and Hyprland's `hyprctl` for guarded automatic insertion.
 The Ctrl+Super listener needs read access to input devices; configure a narrowly
 scoped system policy yourself. The app does not install broad input permissions.
-On other Wayland desktops, text remains available for copying when focus cannot
-be verified. No blind automatic paste is attempted.
+Automatic insertion uses the native Lua `send_shortcut` contract verified on
+Hyprland 0.56.2. It targets the captured address, PID and process lifetime, checks
+active focus, released physical modifiers and the window's `no_focus` policy,
+and rechecks active window identity inside the compositor transaction. Text goes
+to the clipboard over stdin, never into Lua or command arguments. Unsupported
+compositors, XWayland targets or uncertain guards retain copied text. There is no
+wtype injection or transport retry after a possible partial paste.
 
 ```bash
 python3 -m venv .venv
@@ -52,7 +57,10 @@ can be selected for supported Whisper GPU builds. Details and limits are in
 
 Local state uses `~/.local/share/local-voice`, settings use
 `~/.config/local-voice`, and engine registration uses
-`~/.local/opt/local-voice/engines`. These are not part of the repository. Optional
+`~/.local/opt/local-voice/engines`. These are not part of the repository. Use the same application source on each supported
+host while keeping engine registration, models, settings, dictionary, history and
+retained audio local to that host. An update does not grant input-device access
+or establish support for another compositor. Optional
 summaries currently require the documented Qwen3/llama-server CUDA setup; see
 [summaries](docs/SUMMARIES.md). They never start automatically with a meeting.
 
